@@ -1,13 +1,9 @@
 # app.py
-# 雲端版：你的 ETF + 買房頭期款手機儀表板（for Render）
+# 雲端版：完全前端可操作的 ETF + 買房頭期款手機儀表板（for Render）
 # 功能：
-# - 固定持股 + 配息資料
-# - 新增交易 / 配息複投（寫入 SQLite，永久記錄）
-# - 後台頁面：查看 / 篩選 / 編輯 / 刪除交易
-# - 投資組合總覽（含息）
-# - 配息年度對比
-# - 填息比對（最近一次配息）
-# - 買房頭期款進度
+# - 持股 / 配息 / DCA / 交易 都用 SQLite 存，從網頁操作，不用改程式碼
+# - 儀表板顯示：投資組合總覽、配息年度對比、填息比對、買房頭期款進度
+# - 管理頁：/holdings /dividends /dca /trades
 
 import yfinance as yf
 from datetime import datetime, timedelta
@@ -19,9 +15,9 @@ from pathlib import Path
 HOUSE_TARGET_LOW = 6_500_000   # 下限：650 萬
 HOUSE_TARGET_HIGH = 7_500_000  # 上限：750 萬
 ANNUAL_RETURN = 0.06           # 假設年化報酬率 6%
-MONTHLY_DCA = 5_000            # 每月定投總額（0050:2000 + 其他各1000）
+MONTHLY_DCA = 5_000            # 每月定投總額（僅作估算用）
 
-# 抓不到股價時的預設值（可以依你習慣隨時調整）
+# 抓不到股價時的預設值
 DEFAULT_PRICES = {
     "0050": 150.0,
     "0056": 35.0,
@@ -30,7 +26,7 @@ DEFAULT_PRICES = {
 }
 
 # ======== SQLite 資料庫設定 =========
-DB_PATH = Path(__file__).with_name("portfolio_trades.db")
+DB_PATH = Path(__file__).with_name("portfolio_full.db")
 
 
 def get_db():
@@ -41,6 +37,7 @@ def get_db():
 
 def init_db():
     conn = get_db()
+    # 交易紀錄
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS trades (
@@ -53,17 +50,106 @@ def init_db():
         )
         """
     )
+    # 持股
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS holdings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            name TEXT NOT NULL,
+            shares INTEGER NOT NULL,
+            cost REAL NOT NULL
+        )
+        """
+    )
+    # 配息
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dividends (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            cash REAL NOT NULL,
+            note TEXT
+        )
+        """
+    )
+    # 定期定額
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dca (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            amount REAL NOT NULL
+        )
+        """
+    )
     conn.commit()
     conn.close()
+
+
+# ======== 工具：格式化 =========
+
+def fmt_money(x):
+    return f"{x:,.0f}"
+
+
+def fmt_pct(x):
+    return f"{x:,.2f}%"
+
+
+# ======== yfinance 抓股價 =========
+
+def fetch_price_tw(symbol):
+    """用 yfinance 抓台股 ETF 價格，失敗就用 DEFAULT_PRICES。"""
+    ticker_symbol = symbol + ".TW"
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        data = ticker.history(period="5d")
+
+        if not data.empty:
+            close_series = data["Close"].dropna()
+            if not close_series.empty:
+                return float(close_series.iloc[-1])
+    except Exception as e:
+        print(f"[警告] 抓 {symbol} 價格失敗：{e}")
+
+    print(f"[改用預設價格] {symbol} = {DEFAULT_PRICES.get(symbol, 0.0)}")
+    return DEFAULT_PRICES.get(symbol, 0.0)
+
+
+# ======== DB 讀取工具 =========
+
+def get_all_holdings():
+    conn = get_db()
+    cur = conn.execute("SELECT * FROM holdings ORDER BY symbol")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_all_dividends():
+    conn = get_db()
+    cur = conn.execute("SELECT * FROM dividends ORDER BY date DESC, id DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_all_dca():
+    conn = get_db()
+    cur = conn.execute("SELECT * FROM dca ORDER BY date DESC, id DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
 def get_trades_summary():
     """
     回傳：
-      trades_summary: {symbol: {add_shares, add_amount, add_reinvest}}
-      total_amount: 所有交易總金額
-      total_reinvest: 所有交易中配息複投總額
-      total_new_cash: 自掏腰包金額
+      summary: {symbol: {add_shares, add_amount, add_reinvest}}
+      total_amount / total_reinvest / total_new_cash
     """
     conn = get_db()
     cur = conn.execute(
@@ -102,139 +188,59 @@ def get_trades_summary():
     return summary, total_amount, total_reinvest, total_new_cash
 
 
-# ======== 基本資料區：持股、配息、定期定額 =========
+# ======== 配息 / DCA 計算工具 =========
 
-holdings = [
-    {"symbol": "0050", "name": "元大台灣50",        "shares": 3228, "cost": 57.53},
-    {"symbol": "0056", "name": "高股息ETF",         "shares": 3192, "cost": 37.36},
-    {"symbol": "00878", "name": "國泰永續高息",    "shares": 5176, "cost": 22.06},
-    {"symbol": "00919", "name": "群益台灣精選高息", "shares": 5195, "cost": 22.86},
-]
-
-dividends = [
-    {"date": "2023-08-16", "symbol": "00878", "cash": 350,  "note": "2023/08配息"},
-    {"date": "2023-11-16", "symbol": "00878", "cash": 350,  "note": "2023/11配息"},
-    {"date": "2023-12-18", "symbol": "00919", "cash": 358,  "note": "2023/12配息"},
-
-    {"date": "2024-09-23", "symbol": "00919", "cash": 2160, "note": "2024/09配息"},
-    {"date": "2024-10-17", "symbol": "0056",  "cash": 2140, "note": "2024/10配息"},
-    {"date": "2024-11-18", "symbol": "00878", "cash": 1650, "note": "2024/11配息"},
-    {"date": "2024-12-20", "symbol": "00919", "cash": 2160, "note": "2024/12配息"},
-
-    {"date": "2025-01-17", "symbol": "0056",  "cash": 2140, "note": "2025/01配息"},
-    {"date": "2025-02-20", "symbol": "00878", "cash": 1500, "note": "2025/02配息"},
-    {"date": "2025-03-20", "symbol": "00919", "cash": 2160, "note": "2025/03配息"},
-
-    {"date": "2025-04-23", "symbol": "0056",  "cash": 2140, "note": "2025/04配息"},
-    {"date": "2025-05-19", "symbol": "00878", "cash": 1410, "note": "2025/05配息"},
-    {"date": "2025-06-17", "symbol": "00919", "cash": 2160, "note": "2025/06配息"},
-
-    {"date": "2025-07-21", "symbol": "0050",  "cash": 360,  "note": "2025/07配息"},
-    {"date": "2025-07-21", "symbol": "0056",  "cash": 1732, "note": "2025/07配息"},
-    {"date": "2025-08-18", "symbol": "00878", "cash": 1203, "note": "2025/08配息"},
-    {"date": "2025-09-16", "symbol": "00919", "cash": 1629, "note": "2025/09配息"},
-
-    {"date": "2025-10-23", "symbol": "0056",  "cash": 2653, "note": "2025/10配息"},
-    {"date": "2025-11-20", "symbol": "00878", "cash": 2051, "note": "2025/11配息"},
-    # {"date": "2025-12-20", "symbol": "00919", "cash": 2160, "note": "2025/12配息"},
-]
-
-dca_records = [
-    {"date": "2025-10-01", "symbol": "0050", "amount": 2000},
-    {"date": "2025-10-01", "symbol": "0056", "amount": 1000},
-    {"date": "2025-10-01", "symbol": "00878", "amount": 1000},
-    {"date": "2025-10-01", "symbol": "00919", "amount": 1000},
-
-    {"date": "2025-11-01", "symbol": "0050", "amount": 2000},
-    {"date": "2025-11-01", "symbol": "0056", "amount": 1000},
-    {"date": "2025-11-01", "symbol": "00878", "amount": 1000},
-    {"date": "2025-11-01", "symbol": "00919", "amount": 1000},
-
-    {"date": "2025-12-01", "symbol": "0050", "amount": 2000},
-    {"date": "2025-12-01", "symbol": "0056", "amount": 1000},
-    {"date": "2025-12-01", "symbol": "00878", "amount": 1000},
-    {"date": "2025-12-01", "symbol": "00919", "amount": 1000},
-]
-
-# ======== 工具：格式化 =========
-
-def fmt_money(x: float) -> str:
-    return f"{x:,.0f}"
-
-def fmt_pct(x: float) -> str:
-    return f"{x:,.2f}%"
+def get_dividends_total(symbol):
+    conn = get_db()
+    cur = conn.execute(
+        "SELECT COALESCE(SUM(cash),0) AS s FROM dividends WHERE symbol = ?",
+        (symbol,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row["s"] if row and row["s"] is not None else 0.0
 
 
-# ======== 抓股價 =========
-
-def fetch_price_tw(symbol: str) -> float:
-    """用 yfinance 抓台股 ETF 價格，失敗就用 DEFAULT_PRICES。"""
-    ticker_symbol = symbol + ".TW"
-    try:
-        ticker = yf.Ticker(ticker_symbol)
-        data = ticker.history(period="5d")
-
-        if not data.empty:
-            close_series = data["Close"].dropna()
-            if not close_series.empty:
-                return float(close_series.iloc[-1])
-    except Exception as e:
-        print(f"[警告] 抓 {symbol} 價格失敗：{e}")
-
-    print(f"[改用預設價格] {symbol} = {DEFAULT_PRICES.get(symbol, 0.0)}")
-    return DEFAULT_PRICES.get(symbol, 0.0)
+def get_dividends_total_by_year(year):
+    conn = get_db()
+    cur = conn.execute(
+        "SELECT COALESCE(SUM(cash),0) AS s FROM dividends WHERE substr(date,1,4) = ?",
+        (str(year),),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row["s"] if row and row["s"] is not None else 0.0
 
 
-def ensure_prices():
-    """確保 holdings 每檔都有 price 欄位（只抓一次）。"""
-    for h in holdings:
-        if "price" not in h:
-            h["price"] = fetch_price_tw(h["symbol"])
+def get_last_dividend_event(symbol):
+    conn = get_db()
+    cur = conn.execute(
+        "SELECT * FROM dividends WHERE symbol = ? ORDER BY date DESC, id DESC LIMIT 1",
+        (symbol,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
 
 
-def get_total_market_value() -> float:
-    ensure_prices()
-    return sum(h["shares"] * h["price"] for h in holdings)
+def get_dca_total(year=None):
+    conn = get_db()
+    if year is None:
+        cur = conn.execute("SELECT COALESCE(SUM(amount),0) AS s FROM dca")
+        row = cur.fetchone()
+    else:
+        cur = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) AS s FROM dca WHERE substr(date,1,4) = ?",
+            (str(year),),
+        )
+        row = cur.fetchone()
+    conn.close()
+    return row["s"] if row and row["s"] is not None else 0.0
 
 
-# ======== 配息 & DCA 工具 =========
+# ======== 填息計算 =========
 
-def get_dividends_total(symbol: str) -> float:
-    return sum(d["cash"] for d in dividends if d["symbol"] == symbol)
-
-
-def get_dividends_total_by_year(year: int) -> float:
-    total = 0.0
-    for d in dividends:
-        d_year = int(d["date"][:4])
-        if d_year == year:
-            total += d["cash"]
-    return total
-
-
-def get_dca_total(year: int | None = None) -> float:
-    total = 0.0
-    for r in dca_records:
-        if year is not None:
-            r_year = int(r["date"][:4])
-            if r_year != year:
-                continue
-        total += r["amount"]
-    return total
-
-
-# ======== 填息相關工具 =========
-
-def get_last_dividend_event(symbol: str):
-    """回傳某檔 ETF 最近一次配息紀錄（沒有就回 None）。"""
-    events = [d for d in dividends if d["symbol"] == symbol]
-    if not events:
-        return None
-    events_sorted = sorted(events, key=lambda d: d["date"])
-    return events_sorted[-1]
-
-
-def get_pre_ex_close_price(symbol: str, ex_date_str: str) -> float | None:
+def get_pre_ex_close_price(symbol, ex_date_str):
     """
     給 symbol（例如 '00919'）和配息日期（例如 '2025-09-16'），
     回傳「除息日前一個交易日」的收盤價。
@@ -269,7 +275,7 @@ def compute_fill_infos(etf_rows):
 
         last_ev = get_last_dividend_event(symbol)
         if not last_ev:
-            continue  # 這檔暫時沒有配息紀錄
+            continue
 
         last_date = last_ev["date"]
         cash_total = last_ev["cash"]
@@ -277,13 +283,12 @@ def compute_fill_infos(etf_rows):
         if not shares or shares <= 0:
             continue
 
-        div_per_share = cash_total / shares  # 約略每股配息
+        div_per_share = cash_total / shares
 
         pre_close = get_pre_ex_close_price(symbol, last_date)
         if pre_close is None:
             continue
 
-        # 理論除息價 = 除息前價 - 每股配息
         ex_ref_price = pre_close - div_per_share
         filled_amount = now_price - ex_ref_price
 
@@ -292,7 +297,6 @@ def compute_fill_infos(etf_rows):
         else:
             fill_ratio = 0.0
 
-        # 還差多少元才回到除息前價（若已超過，則 0）
         gap_to_fill = max(0.0, pre_close - now_price)
 
         fill_infos.append({
@@ -309,12 +313,9 @@ def compute_fill_infos(etf_rows):
     return fill_infos
 
 
-# ======== 買房相關：估算達成時間 =========
+# ======== 買房目標試算 =========
 
-def estimate_years_to_target(current_value: float,
-                             monthly_invest: float,
-                             annual_return: float,
-                             target: float):
+def estimate_years_to_target(current_value, monthly_invest, annual_return, target):
     r = annual_return
     yearly_invest = monthly_invest * 12
     years = 0.0
@@ -332,50 +333,38 @@ def estimate_years_to_target(current_value: float,
     return None
 
 
-# ======== 計算儀表板數據（會把 DB 交易加上去） =========
+# ======== 儀表板計算 =========
 
-def compute_dashboard(trades_summary=None):
-    """
-    trades_summary: 由 get_trades_summary() 回傳的 dict {symbol: {...}}
-    """
-    if trades_summary is None:
-        trades_summary = {}
-
-    ensure_prices()
-
+def compute_dashboard():
+    holdings_rows = list(get_all_holdings())
     etf_rows = []
+
     total_cost = 0.0
     total_mv = 0.0
     total_dividends = 0.0
 
-    for h in holdings:
+    price_cache = {}
+
+    for h in holdings_rows:
         symbol = h["symbol"]
+        name = h["name"]
         shares = h["shares"]
         cost = h["cost"]
-        price = h["price"]
-        name = h["name"]
 
-        # 把 DB 裡的交易加上去：股數＋成本
-        t = trades_summary.get(symbol)
-        if t:
-            add_shares = t["add_shares"]
-            add_amount = t["add_amount"]
-            if add_shares or add_amount:
-                base_cost_total = cost * shares
-                new_shares = shares + add_shares
-                new_cost_total = base_cost_total + add_amount
-                if new_shares > 0 and new_cost_total > 0:
-                    cost = new_cost_total / new_shares
-                    shares = new_shares
+        if symbol in price_cache:
+            price = price_cache[symbol]
+        else:
+            price = fetch_price_tw(symbol)
+            price_cache[symbol] = price
 
         cost_total = shares * cost
         mv = shares * price
         profit = mv - cost_total
-        pl_pct = (profit / cost_total * 100) if cost_total else 0
+        pl_pct = (profit / cost_total * 100) if cost_total else 0.0
 
         div_total = get_dividends_total(symbol)
         profit_with_div = profit + div_total
-        pl_with_div_pct = (profit_with_div / cost_total * 100) if cost_total else 0
+        pl_with_div_pct = (profit_with_div / cost_total * 100) if cost_total else 0.0
 
         total_cost += cost_total
         total_mv += mv
@@ -397,8 +386,8 @@ def compute_dashboard(trades_summary=None):
 
     total_profit = total_mv - total_cost
     total_profit_with_div = total_profit + total_dividends
-    total_pl_pct = (total_profit / total_cost * 100) if total_cost else 0
-    total_pl_with_div_pct = (total_profit_with_div / total_cost * 100) if total_cost else 0
+    total_pl_pct = (total_profit / total_cost * 100) if total_cost else 0.0
+    total_pl_with_div_pct = (total_profit_with_div / total_cost * 100) if total_cost else 0.0
 
     current_year = datetime.now().year
     last_year = current_year - 1
@@ -406,21 +395,20 @@ def compute_dashboard(trades_summary=None):
     div_this_year = get_dividends_total_by_year(current_year)
     diff_div = div_this_year - div_last_year
 
-    # DCA 數字先保留（目前沒顯示）
     dca_total_all = get_dca_total()
     profit_vs_dca = None
     pl_vs_dca_pct = None
-    if dca_total_all > 0:
+    if dca_total_all > 0 and total_mv > 0:
         profit_vs_dca = total_mv - dca_total_all
-        pl_vs_dca_pct = profit_vs_dca / dca_total_all * 100
+        pl_vs_dca_pct = profit_vs_dca / dca_total_all * 100.0
 
     current_mv = total_mv
-    diff_low = max(0, HOUSE_TARGET_LOW - current_mv)
-    diff_high = max(0, HOUSE_TARGET_HIGH - current_mv)
-    years_low = estimate_years_to_target(current_mv, MONTHLY_DCA, ANNUAL_RETURN, HOUSE_TARGET_LOW)
-    years_high = estimate_years_to_target(current_mv, MONTHLY_DCA, ANNUAL_RETURN, HOUSE_TARGET_HIGH)
+    diff_low = max(0.0, HOUSE_TARGET_LOW - current_mv)
+    diff_high = max(0.0, HOUSE_TARGET_HIGH - current_mv)
+    years_low = estimate_years_to_target(current_mv, MONTHLY_DCA, ANNUAL_RETURN, HOUSE_TARGET_LOW) if current_mv > 0 else None
+    years_high = estimate_years_to_target(current_mv, MONTHLY_DCA, ANNUAL_RETURN, HOUSE_TARGET_HIGH) if current_mv > 0 else None
 
-    fill_infos = compute_fill_infos(etf_rows)
+    fill_infos = compute_fill_infos(etf_rows) if etf_rows else []
 
     return {
         "etfs": etf_rows,
@@ -456,9 +444,9 @@ def compute_dashboard(trades_summary=None):
     }
 
 
-# ======== HTML 模板（首頁：儀表板） =========
+# ======== HTML 模板：首頁（儀表板） =========
 
-TEMPLATE = """
+TEMPLATE_INDEX = """
 <!doctype html>
 <html>
 <head>
@@ -487,14 +475,16 @@ TEMPLATE = """
       color: #666;
       margin-bottom: 8px;
     }
-    .top-link {
+    .nav {
       text-align: center;
-      margin-bottom: 10px;
       font-size: 12px;
+      margin-bottom: 10px;
+      line-height: 1.6;
     }
-    .top-link a {
+    .nav a {
       color: #3949ab;
       text-decoration: none;
+      margin: 0 4px;
     }
     .card {
       background: #fff;
@@ -576,7 +566,7 @@ TEMPLATE = """
       margin-top: 6px;
       line-height: 1.4;
     }
-    input[type="number"], select {
+    input[type="number"], input[type="date"], select {
       border-radius: 999px;
       border: 1px solid #ddd;
       padding: 4px 8px;
@@ -592,14 +582,22 @@ TEMPLATE = """
 <div class="container">
   <h1>ETF & 買房儀表板</h1>
   <div class="subtitle">最後更新：{{ now }}</div>
-  <div class="top-link">
-    <a href="{{ url_for('trades_page') }}">查看 / 編輯交易紀錄 ▶</a>
+  <div class="nav">
+    <a href="{{ url_for('holdings_page') }}">持股管理</a> ·
+    <a href="{{ url_for('dividends_page') }}">配息管理</a> ·
+    <a href="{{ url_for('dca_page') }}">DCA 管理</a> ·
+    <a href="{{ url_for('trades_page') }}">交易紀錄</a>
   </div>
 
   <!-- 新增交易 / 配息複投 -->
   <div class="card">
     <h2>新增交易 / 配息複投</h2>
+    {% if etfs %}
     <form method="post">
+      <div class="row">
+        <span class="label">日期</span>
+        <input type="date" name="date" value="{{ today_date }}">
+      </div>
       <div class="row">
         <span class="label">標的</span>
         <select name="symbol">
@@ -627,6 +625,11 @@ TEMPLATE = """
         </button>
       </div>
     </form>
+    {% else %}
+      <div class="note">
+        目前尚未設定任何持股，請先到「持股管理」頁面新增至少一檔 ETF。
+      </div>
+    {% endif %}
     <div class="note">
       歷史累積：投入 {{ fmt_money(trade_totals.total_amount) }} 元，<br>
       其中配息複投 {{ fmt_money(trade_totals.total_reinvest) }} 元，<br>
@@ -636,44 +639,48 @@ TEMPLATE = """
 
   <div class="card">
     <h2>投資組合總覽 <span class="chip">含息</span></h2>
-    <div class="row">
-      <span class="label">總成本（含歷史交易）</span>
-      <span class="value">{{ fmt_money(totals.total_cost) }} 元</span>
-    </div>
-    <div class="row">
-      <span class="label">總市值</span>
-      <span class="value">{{ fmt_money(totals.total_mv) }} 元</span>
-    </div>
-    <div class="big-number {% if totals.total_profit_with_div > 0 %}positive{% elif totals.total_profit_with_div < 0 %}negative{% else %}neutral{% endif %}">
-      含息報酬率：{{ fmt_pct(totals.total_pl_with_div_pct) }}
-    </div>
-    <div class="row">
-      <span class="label">未實現損益</span>
-      <span class="value {% if totals.total_profit > 0 %}positive{% elif totals.total_profit < 0 %}negative{% else %}neutral{% endif %}">
-        {{ fmt_money(totals.total_profit) }} 元
-      </span>
-    </div>
-    <div class="row">
-      <span class="label">已領配息總額</span>
-      <span class="value">{{ fmt_money(totals.total_dividends) }} 元</span>
-    </div>
-
-    <div class="etf-list">
-      {% for e in etfs %}
-      <div class="etf-item">
-        <div class="etf-header">
-          <span>{{ e.symbol }} · {{ e.name }}</span>
-          <span class="{% if e.profit_with_div > 0 %}positive{% elif e.profit_with_div < 0 %}negative{% else %}neutral{% endif %}">
-            {{ '%.1f' % e.pl_with_div_pct }}%
-          </span>
-        </div>
-        <div class="etf-sub">
-          <span>股數 {{ e.shares }}｜現價 {{ '%.2f' % e.price }}</span>
-          <span>市值 {{ fmt_money(e.mv) }} 元</span>
-        </div>
+    {% if etfs %}
+      <div class="row">
+        <span class="label">總成本（以持股表為準）</span>
+        <span class="value">{{ fmt_money(totals.total_cost) }} 元</span>
       </div>
-      {% endfor %}
-    </div>
+      <div class="row">
+        <span class="label">總市值</span>
+        <span class="value">{{ fmt_money(totals.total_mv) }} 元</span>
+      </div>
+      <div class="big-number {% if totals.total_profit_with_div > 0 %}positive{% elif totals.total_profit_with_div < 0 %}negative{% else %}neutral{% endif %}">
+        含息報酬率：{{ fmt_pct(totals.total_pl_with_div_pct) }}
+      </div>
+      <div class="row">
+        <span class="label">未實現損益</span>
+        <span class="value {% if totals.total_profit > 0 %}positive{% elif totals.total_profit < 0 %}negative{% else %}neutral{% endif %}">
+          {{ fmt_money(totals.total_profit) }} 元
+        </span>
+      </div>
+      <div class="row">
+        <span class="label">已領配息總額</span>
+        <span class="value">{{ fmt_money(totals.total_dividends) }} 元</span>
+      </div>
+
+      <div class="etf-list">
+        {% for e in etfs %}
+        <div class="etf-item">
+          <div class="etf-header">
+            <span>{{ e.symbol }} · {{ e.name }}</span>
+            <span class="{% if e.profit_with_div > 0 %}positive{% elif e.profit_with_div < 0 %}negative{% else %}neutral{% endif %}">
+              {{ '%.1f' % e.pl_with_div_pct }}%
+            </span>
+          </div>
+          <div class="etf-sub">
+            <span>股數 {{ e.shares }}｜現價 {{ '%.2f' % e.price }}</span>
+            <span>市值 {{ fmt_money(e.mv) }} 元</span>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div>尚未設定持股資料。</div>
+    {% endif %}
   </div>
 
   <div class="card">
@@ -690,7 +697,7 @@ TEMPLATE = """
       {{ '今年比去年多' if div_compare.diff_div >= 0 else '今年比去年少' }}：{{ fmt_money(div_compare.diff_div) }} 元
     </div>
     <div class="note">
-      以 dividends 清單中該年度所有配息現金加總計算。
+      以「配息管理」中填寫的各筆配息紀錄加總計算。
     </div>
   </div>
 
@@ -726,7 +733,7 @@ TEMPLATE = """
         以「除息前收盤價 − 每股配息」為理論除息價，再用目前股價估算填息進度，僅供參考。
       </div>
     {% else %}
-      <div>目前尚無可計算的填息資料。</div>
+      <div>目前尚無可計算的填息資料（請先在持股與配息管理中建立資料）。</div>
     {% endif %}
   </div>
 
@@ -760,9 +767,476 @@ TEMPLATE = """
 </html>
 """
 
-# ======== HTML 模板（交易管理頁 /trades 第二版：可篩選） =========
+# ======== HTML 模板：持股管理 =========
 
-TRADES_TEMPLATE = """
+TEMPLATE_HOLDINGS = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>持股管理</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;margin:0;padding:16px;}
+    .container{max-width:540px;margin:0 auto 32px;}
+    h1{font-size:22px;text-align:center;margin-bottom:8px;}
+    .subtitle{text-align:center;font-size:12px;color:#666;margin-bottom:10px;}
+    .top-link{text-align:center;margin-bottom:10px;font-size:12px;}
+    .top-link a{color:#3949ab;text-decoration:none;}
+    .card{background:#fff;border-radius:16px;padding:14px 16px;margin-bottom:10px;box-shadow:0 4px 12px rgba(0,0,0,0.06);font-size:13px;}
+    .row{display:flex;justify-content:space-between;margin:4px 0;gap:6px;align-items:center;}
+    .label{color:#555;}
+    input[type="text"],input[type="number"]{flex:1;border-radius:999px;border:1px solid #ddd;padding:4px 8px;font-size:13px;}
+    .btn-row{text-align:right;margin-top:8px;}
+    .btn{display:inline-block;padding:4px 10px;border-radius:999px;border:none;font-size:12px;cursor:pointer;text-decoration:none;margin-left:6px;}
+    .btn-primary{background:#3949ab;color:#fff;}
+    .btn-secondary{background:#e0e0e0;color:#333;}
+    .btn-danger{background:#d32f2f;color:#fff;}
+    .tag{display:inline-block;padding:2px 6px;border-radius:999px;background:#eef2ff;font-size:11px;color:#3949ab;margin-left:4px;}
+    form.inline{display:inline;}
+    .note{font-size:11px;color:#777;margin-top:6px;line-height:1.4;}
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>持股管理</h1>
+  <div class="subtitle">設定目前各檔 ETF 的「總股數」與「平均成本」</div>
+  <div class="top-link">
+    <a href="{{ url_for('index') }}">◀ 返回儀表板</a>
+  </div>
+
+  <div class="card">
+    <form method="post">
+      <div class="row">
+        <span class="label">代號</span>
+        <input type="text" name="symbol" placeholder="例如 0050" required>
+      </div>
+      <div class="row">
+        <span class="label">名稱</span>
+        <input type="text" name="name" placeholder="例如 元大台灣50" required>
+      </div>
+      <div class="row">
+        <span class="label">總股數</span>
+        <input type="number" name="shares" min="0" step="1" required>
+      </div>
+      <div class="row">
+        <span class="label">平均成本</span>
+        <input type="number" name="cost" min="0" step="0.01" required>
+      </div>
+      <div class="btn-row">
+        <button type="submit" class="btn btn-primary">新增持股</button>
+      </div>
+      <div class="note">
+        若同一檔 ETF 想修改，建議直接編輯既有那一筆，而不是重複新增多筆。
+      </div>
+    </form>
+  </div>
+
+  {% for h in holdings %}
+  <div class="card">
+    <div class="row">
+      <span class="label">
+        #{{ h.id }}
+        <span class="tag">{{ h.symbol }}</span>
+      </span>
+      <span>{{ h.name }}</span>
+    </div>
+    <div class="row">
+      <span class="label">總股數</span>
+      <span>{{ h.shares }}</span>
+    </div>
+    <div class="row">
+      <span class="label">平均成本</span>
+      <span>{{ '%.2f' % h.cost }} 元</span>
+    </div>
+    <div class="btn-row">
+      <a href="{{ url_for('edit_holding', holding_id=h.id) }}" class="btn btn-secondary">編輯</a>
+      <form class="inline" method="post"
+            action="{{ url_for('delete_holding', holding_id=h.id) }}"
+            onsubmit="return confirm('確定要刪除這檔持股嗎？\\nID: {{ h.id }}  標的: {{ h.symbol }}');">
+        <button type="submit" class="btn btn-danger">刪除</button>
+      </form>
+    </div>
+  </div>
+  {% else %}
+  <div class="card">
+    目前尚未新增任何持股。
+  </div>
+  {% endfor %}
+</div>
+</body>
+</html>
+"""
+
+# ======== HTML 模板：持股編輯 =========
+
+TEMPLATE_HOLDINGS_EDIT = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>編輯持股 #{{ h.id }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;margin:0;padding:16px;}
+    .container{max-width:480px;margin:0 auto 32px;}
+    h1{font-size:20px;text-align:center;margin-bottom:8px;}
+    .subtitle{text-align:center;font-size:12px;color:#666;margin-bottom:12px;}
+    .card{background:#fff;border-radius:16px;padding:16px 18px;margin-bottom:14px;box-shadow:0 4px 12px rgba(0,0,0,0.06);}
+    .row{display:flex;justify-content:space-between;margin:6px 0;gap:8px;align-items:center;font-size:14px;}
+    .label{color:#555;flex:0 0 80px;}
+    input[type="text"],input[type="number"]{flex:1;border-radius:999px;border:1px solid #ddd;padding:6px 10px;font-size:14px;}
+    .btn-row{text-align:right;margin-top:10px;}
+    .btn{display:inline-block;padding:6px 14px;border-radius:999px;border:none;font-size:13px;cursor:pointer;text-decoration:none;margin-left:8px;}
+    .btn-primary{background:#3949ab;color:#fff;}
+    .btn-secondary{background:#e0e0e0;color:#333;}
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>編輯持股 #{{ h.id }}</h1>
+  <div class="subtitle">標的：{{ h.symbol }}</div>
+
+  <div class="card">
+    <form method="post">
+      <div class="row">
+        <span class="label">代號</span>
+        <input type="text" name="symbol" value="{{ h.symbol }}">
+      </div>
+      <div class="row">
+        <span class="label">名稱</span>
+        <input type="text" name="name" value="{{ h.name }}">
+      </div>
+      <div class="row">
+        <span class="label">總股數</span>
+        <input type="number" name="shares" min="0" step="1" value="{{ h.shares }}">
+      </div>
+      <div class="row">
+        <span class="label">平均成本</span>
+        <input type="number" name="cost" min="0" step="0.01" value="{{ h.cost }}">
+      </div>
+      <div class="btn-row">
+        <a href="{{ url_for('holdings_page') }}" class="btn btn-secondary">取消</a>
+        <button type="submit" class="btn btn-primary">儲存變更</button>
+      </div>
+    </form>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+# ======== HTML 模板：配息管理 =========
+
+TEMPLATE_DIVIDENDS = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>配息管理</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;margin:0;padding:16px;}
+    .container{max-width:540px;margin:0 auto 32px;}
+    h1{font-size:22px;text-align:center;margin-bottom:8px;}
+    .subtitle{text-align:center;font-size:12px;color:#666;margin-bottom:10px;}
+    .top-link{text-align:center;margin-bottom:10px;font-size:12px;}
+    .top-link a{color:#3949ab;text-decoration:none;}
+    .card{background:#fff;border-radius:16px;padding:14px 16px;margin-bottom:10px;box-shadow:0 4px 12px rgba(0,0,0,0.06);font-size:13px;}
+    .row{display:flex;justify-content:space-between;margin:4px 0;gap:6px;align-items:center;}
+    .label{color:#555;}
+    input[type="text"],input[type="number"],input[type="date"]{flex:1;border-radius:999px;border:1px solid #ddd;padding:4px 8px;font-size:13px;}
+    .btn-row{text-align:right;margin-top:8px;}
+    .btn{display:inline-block;padding:4px 10px;border-radius:999px;border:none;font-size:12px;cursor:pointer;text-decoration:none;margin-left:6px;}
+    .btn-primary{background:#3949ab;color:#fff;}
+    .btn-secondary{background:#e0e0e0;color:#333;}
+    .btn-danger{background:#d32f2f;color:#fff;}
+    .tag{display:inline-block;padding:2px 6px;border-radius:999px;background:#eef2ff;font-size:11px;color:#3949ab;margin-left:4px;}
+    form.inline{display:inline;}
+    .note{font-size:11px;color:#777;margin-top:6px;line-height:1.4;}
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>配息管理</h1>
+  <div class="subtitle">記錄每次配息金額，供儀表板統計 & 填息比對使用</div>
+  <div class="top-link">
+    <a href="{{ url_for('index') }}">◀ 返回儀表板</a>
+  </div>
+
+  <div class="card">
+    <form method="post">
+      <div class="row">
+        <span class="label">日期</span>
+        <input type="date" name="date" required>
+      </div>
+      <div class="row">
+        <span class="label">標的</span>
+        <input type="text" name="symbol" placeholder="例如 00919" required>
+      </div>
+      <div class="row">
+        <span class="label">配息總額</span>
+        <input type="number" name="cash" min="0" step="0.01" required>
+      </div>
+      <div class="row">
+        <span class="label">備註</span>
+        <input type="text" name="note" placeholder="例如 2025/09 配息">
+      </div>
+      <div class="btn-row">
+        <button type="submit" class="btn btn-primary">新增配息紀錄</button>
+      </div>
+      <div class="note">
+        可輸入每次「實際入帳」的配息，之後可用來看年度總額與填息速度。
+      </div>
+    </form>
+  </div>
+
+  {% for d in dividends %}
+  <div class="card">
+    <div class="row">
+      <span class="label">
+        #{{ d.id }}
+        <span class="tag">{{ d.symbol }}</span>
+      </span>
+      <span>{{ d.date }}</span>
+    </div>
+    <div class="row">
+      <span class="label">現金</span>
+      <span>{{ fmt_money(d.cash) }} 元</span>
+    </div>
+    {% if d.note %}
+    <div class="row">
+      <span class="label">備註</span>
+      <span>{{ d.note }}</span>
+    </div>
+    {% endif %}
+    <div class="btn-row">
+      <a href="{{ url_for('edit_dividend', div_id=d.id) }}" class="btn btn-secondary">編輯</a>
+      <form class="inline" method="post"
+            action="{{ url_for('delete_dividend', div_id=d.id) }}"
+            onsubmit="return confirm('確定要刪除這筆配息紀錄嗎？\\nID: {{ d.id }}  標的: {{ d.symbol }}');">
+        <button type="submit" class="btn btn-danger">刪除</button>
+      </form>
+    </div>
+  </div>
+  {% else %}
+  <div class="card">
+    目前尚未新增任何配息紀錄。
+  </div>
+  {% endfor %}
+</div>
+</body>
+</html>
+"""
+
+# ======== HTML 模板：配息編輯 =========
+
+TEMPLATE_DIVIDENDS_EDIT = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>編輯配息 #{{ d.id }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;margin:0;padding:16px;}
+    .container{max-width:480px;margin:0 auto 32px;}
+    h1{font-size:20px;text-align:center;margin-bottom:8px;}
+    .subtitle{text-align:center;font-size:12px;color:#666;margin-bottom:12px;}
+    .card{background:#fff;border-radius:16px;padding:16px 18px;margin-bottom:14px;box-shadow:0 4px 12px rgba(0,0,0,0.06);}
+    .row{display:flex;justify-content:space-between;margin:6px 0;gap:8px;align-items:center;font-size:14px;}
+    .label{color:#555;flex:0 0 80px;}
+    input[type="text"],input[type="number"],input[type="date"]{flex:1;border-radius:999px;border:1px solid #ddd;padding:6px 10px;font-size:14px;}
+    .btn-row{text-align:right;margin-top:10px;}
+    .btn{display:inline-block;padding:6px 14px;border-radius:999px;border:none;font-size:13px;cursor:pointer;text-decoration:none;margin-left:8px;}
+    .btn-primary{background:#3949ab;color:#fff;}
+    .btn-secondary{background:#e0e0e0;color:#333;}
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>編輯配息 #{{ d.id }}</h1>
+  <div class="subtitle">標的：{{ d.symbol }}</div>
+
+  <div class="card">
+    <form method="post">
+      <div class="row">
+        <span class="label">日期</span>
+        <input type="date" name="date" value="{{ d.date }}">
+      </div>
+      <div class="row">
+        <span class="label">標的</span>
+        <input type="text" name="symbol" value="{{ d.symbol }}">
+      </div>
+      <div class="row">
+        <span class="label">現金</span>
+        <input type="number" name="cash" min="0" step="0.01" value="{{ d.cash }}">
+      </div>
+      <div class="row">
+        <span class="label">備註</span>
+        <input type="text" name="note" value="{{ d.note or '' }}">
+      </div>
+      <div class="btn-row">
+        <a href="{{ url_for('dividends_page') }}" class="btn btn-secondary">取消</a>
+        <button type="submit" class="btn btn-primary">儲存變更</button>
+      </div>
+    </form>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+# ======== HTML 模板：DCA 管理 =========
+
+TEMPLATE_DCA = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>DCA 管理</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;margin:0;padding:16px;}
+    .container{max-width:540px;margin:0 auto 32px;}
+    h1{font-size:22px;text-align:center;margin-bottom:8px;}
+    .subtitle{text-align:center;font-size:12px;color:#666;margin-bottom:10px;}
+    .top-link{text-align:center;margin-bottom:10px;font-size:12px;}
+    .top-link a{color:#3949ab;text-decoration:none;}
+    .card{background:#fff;border-radius:16px;padding:14px 16px;margin-bottom:10px;box-shadow:0 4px 12px rgba(0,0,0,0.06);font-size:13px;}
+    .row{display:flex;justify-content:space-between;margin:4px 0;gap:6px;align-items:center;}
+    .label{color:#555;}
+    input[type="text"],input[type="number"],input[type="date"]{flex:1;border-radius:999px;border:1px solid #ddd;padding:4px 8px;font-size:13px;}
+    .btn-row{text-align:right;margin-top:8px;}
+    .btn{display:inline-block;padding:4px 10px;border-radius:999px;border:none;font-size:12px;cursor:pointer;text-decoration:none;margin-left:6px;}
+    .btn-primary{background:#3949ab;color:#fff;}
+    .btn-secondary{background:#e0e0e0;color:#333;}
+    .btn-danger{background:#d32f2f;color:#fff;}
+    .tag{display:inline-block;padding:2px 6px;border-radius:999px;background:#eef2ff;font-size:11px;color:#3949ab;margin-left:4px;}
+    form.inline{display:inline;}
+    .note{font-size:11px;color:#777;margin-top:6px;line-height:1.4;}
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>DCA 管理</h1>
+  <div class="subtitle">記錄每月定期定額投入金額，供自己回顧</div>
+  <div class="top-link">
+    <a href="{{ url_for('index') }}">◀ 返回儀表板</a>
+  </div>
+
+  <div class="card">
+    <form method="post">
+      <div class="row">
+        <span class="label">日期</span>
+        <input type="date" name="date" required>
+      </div>
+      <div class="row">
+        <span class="label">標的</span>
+        <input type="text" name="symbol" placeholder="例如 0050" required>
+      </div>
+      <div class="row">
+        <span class="label">金額</span>
+        <input type="number" name="amount" min="0" step="0.01" required>
+      </div>
+      <div class="btn-row">
+        <button type="submit" class="btn btn-primary">新增 DCA 紀錄</button>
+      </div>
+      <div class="note">
+        這裡只是記錄用途，不會自動改變「持股管理」中的股數與成本。
+      </div>
+    </form>
+  </div>
+
+  {% for r in records %}
+  <div class="card">
+    <div class="row">
+      <span class="label">
+        #{{ r.id }}
+        <span class="tag">{{ r.symbol }}</span>
+      </span>
+      <span>{{ r.date }}</span>
+    </div>
+    <div class="row">
+      <span class="label">金額</span>
+      <span>{{ fmt_money(r.amount) }} 元</span>
+    </div>
+    <div class="btn-row">
+      <a href="{{ url_for('edit_dca', dca_id=r.id) }}" class="btn btn-secondary">編輯</a>
+      <form class="inline" method="post"
+            action="{{ url_for('delete_dca', dca_id=r.id) }}"
+            onsubmit="return confirm('確定要刪除這筆 DCA 紀錄嗎？\\nID: {{ r.id }}  標的: {{ r.symbol }}');">
+        <button type="submit" class="btn btn-danger">刪除</button>
+      </form>
+    </div>
+  </div>
+  {% else %}
+  <div class="card">
+    目前尚未新增任何 DCA 紀錄。
+  </div>
+  {% endfor %}
+</div>
+</body>
+</html>
+"""
+
+# ======== HTML 模板：DCA 編輯 =========
+
+TEMPLATE_DCA_EDIT = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>編輯 DCA #{{ r.id }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;margin:0;padding:16px;}
+    .container{max-width:480px;margin:0 auto 32px;}
+    h1{font-size:20px;text-align:center;margin-bottom:8px;}
+    .subtitle{text-align:center;font-size:12px;color:#666;margin-bottom:12px;}
+    .card{background:#fff;border-radius:16px;padding:16px 18px;margin-bottom:14px;box-shadow:0 4px 12px rgba(0,0,0,0.06);}
+    .row{display:flex;justify-content:space-between;margin:6px 0;gap:8px;align-items:center;font-size:14px;}
+    .label{color:#555;flex:0 0 80px;}
+    input[type="text"],input[type="number"],input[type="date"]{flex:1;border-radius:999px;border:1px solid:#ddd;padding:6px 10px;font-size:14px;}
+    .btn-row{text-align:right;margin-top:10px;}
+    .btn{display:inline-block;padding:6px 14px;border-radius:999px;border:none;font-size:13px;cursor:pointer;text-decoration:none;margin-left:8px;}
+    .btn-primary{background:#3949ab;color:#fff;}
+    .btn-secondary{background:#e0e0e0;color:#333;}
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>編輯 DCA #{{ r.id }}</h1>
+  <div class="subtitle">標的：{{ r.symbol }}</div>
+
+  <div class="card">
+    <form method="post">
+      <div class="row">
+        <span class="label">日期</span>
+        <input type="date" name="date" value="{{ r.date }}">
+      </div>
+      <div class="row">
+        <span class="label">標的</span>
+        <input type="text" name="symbol" value="{{ r.symbol }}">
+      </div>
+      <div class="row">
+        <span class="label">金額</span>
+        <input type="number" name="amount" min="0" step="0.01" value="{{ r.amount }}">
+      </div>
+      <div class="btn-row">
+        <a href="{{ url_for('dca_page') }}" class="btn btn-secondary">取消</a>
+        <button type="submit" class="btn btn-primary">儲存變更</button>
+      </div>
+    </form>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+# ======== HTML 模板：交易管理 =========
+
+TEMPLATE_TRADES = """
 <!doctype html>
 <html>
 <head>
@@ -770,159 +1244,36 @@ TRADES_TEMPLATE = """
   <title>交易紀錄管理</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #f5f5f7;
-      margin: 0;
-      padding: 16px;
-    }
-    .container {
-      max-width: 540px;
-      margin: 0 auto 32px;
-    }
-    h1 {
-      font-size: 22px;
-      text-align: center;
-      margin-bottom: 8px;
-    }
-    .subtitle {
-      text-align: center;
-      font-size: 12px;
-      color: #666;
-      margin-bottom: 8px;
-    }
-    .top-link {
-      text-align: center;
-      margin-bottom: 10px;
-      font-size: 12px;
-    }
-    .top-link a {
-      color: #3949ab;
-      text-decoration: none;
-    }
-    .card {
-      background: #fff;
-      border-radius: 16px;
-      padding: 14px 16px;
-      margin-bottom: 10px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.06);
-      font-size: 13px;
-    }
-    .row {
-      display: flex;
-      justify-content: space-between;
-      margin: 2px 0;
-      gap: 6px;
-    }
-    .label {
-      color: #555;
-    }
-    .tag {
-      display: inline-block;
-      padding: 2px 6px;
-      border-radius: 999px;
-      background: #eef2ff;
-      font-size: 11px;
-      color: #3949ab;
-      margin-left: 4px;
-    }
-    .btn-row {
-      margin-top: 6px;
-      text-align: right;
-    }
-    .btn {
-      display: inline-block;
-      padding: 4px 10px;
-      border-radius: 999px;
-      border: none;
-      font-size: 12px;
-      cursor: pointer;
-      text-decoration: none;
-      margin-left: 6px;
-    }
-    .btn-edit {
-      background: #3949ab;
-      color: #fff;
-    }
-    .btn-delete {
-      background: #d32f2f;
-      color: #fff;
-    }
-    .note {
-      font-size: 11px;
-      color: #777;
-      margin-top: 6px;
-      line-height: 1.4;
-    }
-    form.inline {
-      display: inline;
-    }
-    .filter-card {
-      background: #fff;
-      border-radius: 16px;
-      padding: 10px 12px;
-      margin-bottom: 10px;
-      box-shadow: 0 3px 8px rgba(0,0,0,0.04);
-      font-size: 12px;
-    }
-    .filter-row {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 6px;
-      align-items: center;
-    }
-    .filter-row label {
-      font-size: 12px;
-      color: #555;
-      flex: 0 0 50px;
-    }
-    .filter-row select {
-      flex: 1;
-      border-radius: 999px;
-      border: 1px solid #ddd;
-      padding: 4px 8px;
-      font-size: 12px;
-    }
-    .filter-actions {
-      text-align: right;
-      margin-top: 4px;
-    }
-    .btn-filter {
-      padding: 4px 10px;
-      border-radius: 999px;
-      border: none;
-      background: #3949ab;
-      color: #fff;
-      font-size: 12px;
-      cursor: pointer;
-      margin-left: 6px;
-    }
-    .btn-reset {
-      padding: 4px 10px;
-      border-radius: 999px;
-      border: none;
-      background: #e0e0e0;
-      color: #333;
-      font-size: 12px;
-      cursor: pointer;
-    }
-    .pill {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 999px;
-      background: #f1f3ff;
-      color: #3949ab;
-      font-size: 11px;
-      margin-right: 4px;
-    }
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;margin:0;padding:16px;}
+    .container{max-width:540px;margin:0 auto 32px;}
+    h1{font-size:22px;text-align:center;margin-bottom:8px;}
+    .subtitle{text-align:center;font-size:12px;color:#666;margin-bottom:8px;}
+    .top-link{textalign:center;margin-bottom:10px;font-size:12px;}
+    .top-link a{color:#3949ab;text-decoration:none;}
+    .card{background:#fff;border-radius:16px;padding:14px 16px;margin-bottom:10px;box-shadow:0 4px 12px rgba(0,0,0,0.06);font-size:13px;}
+    .row{display:flex;justify-content:space-between;margin:2px 0;gap:6px;align-items:center;}
+    .label{color:#555;}
+    .tag{display:inline-block;padding:2px 6px;border-radius:999px;background:#eef2ff;font-size:11px;color:#3949ab;margin-left:4px;}
+    .btn-row{margin-top:6px;text-align:right;}
+    .btn{display:inline-block;padding:4px 10px;border-radius:999px;border:none;font-size:12px;cursor:pointer;text-decoration:none;margin-left:6px;}
+    .btn-edit{background:#3949ab;color:#fff;}
+    .btn-delete{background:#d32f2f;color:#fff;}
+    form.inline{display:inline;}
+    .note{font-size:11px;color:#777;margin-top:6px;line-height:1.4;}
+    .filter-card{background:#fff;border-radius:16px;padding:10px 12px;margin-bottom:10px;box-shadow:0 3px 8px rgba(0,0,0,0.04);font-size:12px;}
+    .filter-row{display:flex;gap:8px;margin-bottom:6px;align-items:center;}
+    .filter-row label{font-size:12px;color:#555;flex:0 0 50px;}
+    .filter-row select{flex:1;border-radius:999px;border:1px solid:#ddd;padding:4px 8px;font-size:12px;}
+    .filter-actions{text-align:right;margin-top:4px;}
+    .btn-filter{padding:4px 10px;border-radius:999px;border:none;background:#3949ab;color:#fff;font-size:12px;cursor:pointer;margin-left:6px;}
+    .btn-reset{padding:4px 10px;border-radius:999px;border:none;background:#e0e0e0;color:#333;font-size:12px;cursor:pointer;}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#f1f3ff;color:#3949ab;font-size:11px;margin-right:4px;}
   </style>
 </head>
 <body>
 <div class="container">
   <h1>交易紀錄管理</h1>
-  <div class="subtitle">
-    目前顯示：{{ trades|length }} 筆
-  </div>
+  <div class="subtitle">目前顯示：{{ trades|length }} 筆</div>
   <div class="top-link">
     <a href="{{ url_for('index') }}">◀ 返回儀表板</a>
   </div>
@@ -950,9 +1301,7 @@ TRADES_TEMPLATE = """
       </div>
       <div class="filter-actions">
         <button type="submit" class="btn-filter">套用篩選</button>
-        <button type="button" class="btn-reset" onclick="window.location='{{ url_for('trades_page') }}'">
-          清除
-        </button>
+        <button type="button" class="btn-reset" onclick="window.location='{{ url_for('trades_page') }}'">清除</button>
       </div>
     </form>
     <div class="note">
@@ -1031,8 +1380,7 @@ TRADES_TEMPLATE = """
     </div>
     <div class="btn-row">
       <a class="btn btn-edit" href="{{ url_for('edit_trade', trade_id=t.id) }}">編輯</a>
-      <form class="inline"
-            method="post"
+      <form class="inline" method="post"
             action="{{ url_for('delete_trade', trade_id=t.id) }}"
             onsubmit="return confirm('確定要刪除這筆交易嗎？\\nID: {{ t.id }}  標的: {{ t.symbol }}');">
         <button type="submit" class="btn btn-delete">刪除</button>
@@ -1044,15 +1392,14 @@ TRADES_TEMPLATE = """
     目前在此篩選條件下，沒有任何交易紀錄。
   </div>
   {% endfor %}
-
 </div>
 </body>
 </html>
 """
 
-# ======== HTML 模板（交易編輯頁 /trades/edit/<id>） =========
+# ======== HTML 模板：交易編輯 =========
 
-EDIT_TEMPLATE = """
+TEMPLATE_TRADES_EDIT = """
 <!doctype html>
 <html>
 <head>
@@ -1060,89 +1407,25 @@ EDIT_TEMPLATE = """
   <title>編輯交易 #{{ trade.id }}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #f5f5f7;
-      margin: 0;
-      padding: 16px;
-    }
-    .container {
-      max-width: 480px;
-      margin: 0 auto 32px;
-    }
-    h1 {
-      font-size: 20px;
-      text-align: center;
-      margin-bottom: 8px;
-    }
-    .subtitle {
-      text-align: center;
-      font-size: 12px;
-      color: #666;
-      margin-bottom: 12px;
-    }
-    .card {
-      background: #fff;
-      border-radius: 16px;
-      padding: 16px 18px;
-      margin-bottom: 14px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.06);
-    }
-    .row {
-      display: flex;
-      justify-content: space-between;
-      margin: 6px 0;
-      gap: 8px;
-      font-size: 14px;
-      align-items: center;
-    }
-    .label {
-      color: #555;
-      flex: 0 0 90px;
-    }
-    input[type="number"], input[type="text"] {
-      flex: 1;
-      border-radius: 999px;
-      border: 1px solid #ddd;
-      padding: 6px 10px;
-      font-size: 14px;
-    }
-    .note {
-      font-size: 11px;
-      color: #777;
-      margin-top: 6px;
-      line-height: 1.4;
-    }
-    .btn-row {
-      margin-top: 10px;
-      text-align: right;
-    }
-    .btn {
-      display: inline-block;
-      padding: 6px 14px;
-      border-radius: 999px;
-      border: none;
-      font-size: 13px;
-      cursor: pointer;
-      text-decoration: none;
-      margin-left: 8px;
-    }
-    .btn-primary {
-      background: #3949ab;
-      color: #fff;
-    }
-    .btn-secondary {
-      background: #e0e0e0;
-      color: #333;
-    }
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;margin:0;padding:16px;}
+    .container{max-width:480px;margin:0 auto 32px;}
+    h1{font-size:20px;text-align:center;margin-bottom:8px;}
+    .subtitle{text-align:center;font-size:12px;color:#666;margin-bottom:12px;}
+    .card{background:#fff;border-radius:16px;padding:16px 18px;margin-bottom:14px;box-shadow:0 4px 12px rgba(0,0,0,0.06);}
+    .row{display:flex;justify-content:space-between;margin:6px 0;gap:8px;align-items:center;font-size:14px;}
+    .label{color:#555;flex:0 0 90px;}
+    input[type="text"],input[type="number"]{flex:1;border-radius:999px;border:1px solid #ddd;padding:6px 10px;font-size:14px;}
+    .note{font-size:11px;color:#777;margin-top:6px;line-height:1.4;}
+    .btn-row{text-align:right;margin-top:10px;}
+    .btn{display:inline-block;padding:6px 14px;border-radius:999px;border:none;font-size:13px;cursor:pointer;text-decoration:none;margin-left:8px;}
+    .btn-primary{background:#3949ab;color:#fff;}
+    .btn-secondary{background:#e0e0e0;color:#333;}
   </style>
 </head>
 <body>
 <div class="container">
   <h1>編輯交易 #{{ trade.id }}</h1>
-  <div class="subtitle">
-    標的：{{ trade.symbol }}
-  </div>
+  <div class="subtitle">標的：{{ trade.symbol }}</div>
 
   <div class="card">
     <form method="post">
@@ -1164,7 +1447,7 @@ EDIT_TEMPLATE = """
       </div>
 
       <div class="note">
-        建議日期時間保持 ISO 格式：YYYY-MM-DD HH:MM:SS<br>
+        建議日期時間保持格式：YYYY-MM-DD HH:MM:SS<br>
         例如：2025-12-09 08:30:00
       </div>
 
@@ -1179,7 +1462,7 @@ EDIT_TEMPLATE = """
 </html>
 """
 
-# ======== Flask App =========
+# ======== Flask App & Routes =========
 
 app = Flask(__name__)
 init_db()
@@ -1187,9 +1470,10 @@ init_db()
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    # 處理新增交易表單
+    # 新增交易
     if request.method == "POST":
-        symbol = request.form.get("symbol")
+        date_str = request.form.get("date", "").strip()
+        symbol = request.form.get("symbol", "").strip()
         shares_raw = request.form.get("shares", "").strip()
         amount_raw = request.form.get("amount", "").strip()
         reinvest_raw = request.form.get("reinvest", "").strip()
@@ -1210,17 +1494,23 @@ def index():
             reinvest = 0.0
 
         if symbol and shares > 0 and amount > 0:
+            if date_str:
+                ts_value = f"{date_str} 00:00:00"
+            else:
+                ts_value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
             conn = get_db()
             conn.execute(
                 "INSERT INTO trades (ts, symbol, shares, amount, reinvest) VALUES (?,?,?,?,?)",
-                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, shares, amount, reinvest),
+                (ts_value, symbol, shares, amount, reinvest),
             )
             conn.commit()
             conn.close()
 
     trades_summary, total_amount, total_reinvest, total_new_cash = get_trades_summary()
-    data = compute_dashboard(trades_summary=trades_summary)
+    data = compute_dashboard()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    today_date = datetime.now().strftime("%Y-%m-%d")
 
     trade_totals = {
         "total_amount": total_amount,
@@ -1229,22 +1519,265 @@ def index():
     }
 
     return render_template_string(
-        TEMPLATE,
+        TEMPLATE_INDEX,
         now=now,
+        today_date=today_date,
         fmt_money=fmt_money,
         fmt_pct=fmt_pct,
         ANNUAL_RETURN=ANNUAL_RETURN,
         MONTHLY_DCA=MONTHLY_DCA,
         trade_totals=trade_totals,
-        **data,
+        **data,   # 這裡包含 etfs / totals / div_compare / dca_compare / house_goal / fill_infos
     )
 
+
+# ----- 持股管理 -----
+
+@app.route("/holdings", methods=["GET", "POST"])
+def holdings_page():
+    if request.method == "POST":
+        symbol = request.form.get("symbol", "").strip()
+        name = request.form.get("name", "").strip()
+        shares_raw = request.form.get("shares", "").strip()
+        cost_raw = request.form.get("cost", "").strip()
+
+        try:
+            shares = int(shares_raw) if shares_raw else 0
+        except ValueError:
+            shares = 0
+
+        try:
+            cost = float(cost_raw) if cost_raw else 0.0
+        except ValueError:
+            cost = 0.0
+
+        if symbol and name and shares > 0 and cost > 0:
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO holdings (symbol, name, shares, cost) VALUES (?,?,?,?)",
+                (symbol, name, shares, cost),
+            )
+            conn.commit()
+            conn.close()
+
+    holdings = get_all_holdings()
+    return render_template_string(
+        TEMPLATE_HOLDINGS,
+        holdings=holdings,
+    )
+
+
+@app.route("/holdings/edit/<int:holding_id>", methods=["GET", "POST"])
+def edit_holding(holding_id):
+    conn = get_db()
+    cur = conn.execute("SELECT * FROM holdings WHERE id = ?", (holding_id,))
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        return "Holding not found", 404
+
+    if request.method == "POST":
+        symbol = request.form.get("symbol", "").strip()
+        name = request.form.get("name", "").strip()
+        shares_raw = request.form.get("shares", "").strip()
+        cost_raw = request.form.get("cost", "").strip()
+
+        try:
+            shares = int(shares_raw) if shares_raw else 0
+        except ValueError:
+            shares = 0
+
+        try:
+            cost = float(cost_raw) if cost_raw else 0.0
+        except ValueError:
+            cost = 0.0
+
+        if symbol and name and shares > 0 and cost > 0:
+            conn.execute(
+                "UPDATE holdings SET symbol = ?, name = ?, shares = ?, cost = ? WHERE id = ?",
+                (symbol, name, shares, cost, holding_id),
+            )
+            conn.commit()
+            conn.close()
+            return redirect(url_for("holdings_page"))
+
+    conn.close()
+    return render_template_string(
+        TEMPLATE_HOLDINGS_EDIT,
+        h=row,
+    )
+
+
+@app.route("/holdings/delete/<int:holding_id>", methods=["POST"])
+def delete_holding(holding_id):
+    conn = get_db()
+    conn.execute("DELETE FROM holdings WHERE id = ?", (holding_id,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for("holdings_page"))
+
+
+# ----- 配息管理 -----
+
+@app.route("/dividends", methods=["GET", "POST"])
+def dividends_page():
+    if request.method == "POST":
+        date_str = request.form.get("date", "").strip()
+        symbol = request.form.get("symbol", "").strip()
+        cash_raw = request.form.get("cash", "").strip()
+        note = request.form.get("note", "").strip()
+
+        try:
+            cash = float(cash_raw) if cash_raw else 0.0
+        except ValueError:
+            cash = 0.0
+
+        if date_str and symbol and cash > 0:
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO dividends (date, symbol, cash, note) VALUES (?,?,?,?)",
+                (date_str, symbol, cash, note if note else None),
+            )
+            conn.commit()
+            conn.close()
+
+    dividends = get_all_dividends()
+    return render_template_string(
+        TEMPLATE_DIVIDENDS,
+        dividends=dividends,
+        fmt_money=fmt_money,
+    )
+
+
+@app.route("/dividends/edit/<int:div_id>", methods=["GET", "POST"])
+def edit_dividend(div_id):
+    conn = get_db()
+    cur = conn.execute("SELECT * FROM dividends WHERE id = ?", (div_id,))
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        return "Dividend not found", 404
+
+    if request.method == "POST":
+        date_str = request.form.get("date", "").strip()
+        symbol = request.form.get("symbol", "").strip()
+        cash_raw = request.form.get("cash", "").strip()
+        note = request.form.get("note", "").strip()
+
+        try:
+            cash = float(cash_raw) if cash_raw else 0.0
+        except ValueError:
+            cash = 0.0
+
+        if date_str and symbol and cash > 0:
+            conn.execute(
+                "UPDATE dividends SET date = ?, symbol = ?, cash = ?, note = ? WHERE id = ?",
+                (date_str, symbol, cash, note if note else None, div_id),
+            )
+            conn.commit()
+            conn.close()
+            return redirect(url_for("dividends_page"))
+
+    conn.close()
+    return render_template_string(
+        TEMPLATE_DIVIDENDS_EDIT,
+        d=row,
+    )
+
+
+@app.route("/dividends/delete/<int:div_id>", methods=["POST"])
+def delete_dividend(div_id):
+    conn = get_db()
+    conn.execute("DELETE FROM dividends WHERE id = ?", (div_id,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for("dividends_page"))
+
+
+# ----- DCA 管理 -----
+
+@app.route("/dca", methods=["GET", "POST"])
+def dca_page():
+    if request.method == "POST":
+        date_str = request.form.get("date", "").strip()
+        symbol = request.form.get("symbol", "").strip()
+        amount_raw = request.form.get("amount", "").strip()
+
+        try:
+            amount = float(amount_raw) if amount_raw else 0.0
+        except ValueError:
+            amount = 0.0
+
+        if date_str and symbol and amount > 0:
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO dca (date, symbol, amount) VALUES (?,?,?)",
+                (date_str, symbol, amount),
+            )
+            conn.commit()
+            conn.close()
+
+    records = get_all_dca()
+    return render_template_string(
+        TEMPLATE_DCA,
+        records=records,
+        fmt_money=fmt_money,
+    )
+
+
+@app.route("/dca/edit/<int:dca_id>", methods=["GET", "POST"])
+def edit_dca(dca_id):
+    conn = get_db()
+    cur = conn.execute("SELECT * FROM dca WHERE id = ?", (dca_id,))
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        return "DCA record not found", 404
+
+    if request.method == "POST":
+        date_str = request.form.get("date", "").strip()
+        symbol = request.form.get("symbol", "").strip()
+        amount_raw = request.form.get("amount", "").strip()
+
+        try:
+            amount = float(amount_raw) if amount_raw else 0.0
+        except ValueError:
+            amount = 0.0
+
+        if date_str and symbol and amount > 0:
+            conn.execute(
+                "UPDATE dca SET date = ?, symbol = ?, amount = ? WHERE id = ?",
+                (date_str, symbol, amount, dca_id),
+            )
+            conn.commit()
+            conn.close()
+            return redirect(url_for("dca_page"))
+
+    conn.close()
+    return render_template_string(
+        TEMPLATE_DCA_EDIT,
+        r=row,
+    )
+
+
+@app.route("/dca/delete/<int:dca_id>", methods=["POST"])
+def delete_dca(dca_id):
+    conn = get_db()
+    conn.execute("DELETE FROM dca WHERE id = ?", (dca_id,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for("dca_page"))
+
+
+# ----- 交易管理 -----
 
 @app.route("/trades")
 def trades_page():
     conn = get_db()
 
-    # 取得所有 symbol / 年份供下拉選單用
     cur = conn.execute("SELECT DISTINCT symbol FROM trades ORDER BY symbol")
     symbols_rows = cur.fetchall()
     symbols = [r["symbol"] for r in symbols_rows]
@@ -1253,11 +1786,9 @@ def trades_page():
     years_rows = cur.fetchall()
     years = [r["y"] for r in years_rows if r["y"]]
 
-    # 讀取篩選條件
     selected_symbol = request.args.get("symbol", "").strip()
     selected_year = request.args.get("year", "").strip()
 
-    # 依篩選條件取出交易紀錄
     sql = "SELECT * FROM trades WHERE 1=1"
     params = []
 
@@ -1274,7 +1805,7 @@ def trades_page():
     rows = cur.fetchall()
 
     # 全部累積
-    trades_summary, total_amount, total_reinvest, total_new_cash = get_trades_summary()
+    _, total_amount, total_reinvest, total_new_cash = get_trades_summary()
     trade_totals = {
         "total_amount": total_amount,
         "total_reinvest": total_reinvest,
@@ -1294,7 +1825,7 @@ def trades_page():
     conn.close()
 
     return render_template_string(
-        TRADES_TEMPLATE,
+        TEMPLATE_TRADES,
         trades=rows,
         trade_totals=trade_totals,
         filtered_totals=filtered_totals,
@@ -1350,7 +1881,7 @@ def edit_trade(trade_id):
 
     conn.close()
     return render_template_string(
-        EDIT_TEMPLATE,
+        TEMPLATE_TRADES_EDIT,
         trade=row,
     )
 
@@ -1366,6 +1897,3 @@ def delete_trade(trade_id):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
-
-
-

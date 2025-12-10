@@ -1,15 +1,26 @@
 # app.py
-# 雲端版：完全前端可操作的 ETF + 買房頭期款手機儀表板（for Render）
+# 雲端版：多使用者登入 + 完全前端可操作的 ETF + 買房頭期款手機儀表板
 # 功能：
-# - 持股 / 配息 / DCA / 交易 都用 SQLite 存，從網頁操作，不用改程式碼
+# - 每個使用者都有自己的 holdings / dividends / dca / trades（用 SQLite + user_id 區分）
 # - 儀表板顯示：投資組合總覽、配息年度對比、填息比對、買房頭期款進度
 # - 管理頁：/holdings /dividends /dca /trades
+# - 登入 / 註冊 / 登出
 
 import yfinance as yf
 from datetime import datetime, timedelta
-from flask import Flask, render_template_string, request, redirect, url_for
+from flask import (
+    Flask,
+    render_template_string,
+    request,
+    redirect,
+    url_for,
+    session,
+    flash,
+)
 import sqlite3
 from pathlib import Path
+from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # ======== 全域設定：買房目標與定投金額 =========
 HOUSE_TARGET_LOW = 6_500_000   # 下限：650 萬
@@ -26,7 +37,8 @@ DEFAULT_PRICES = {
 }
 
 # ======== SQLite 資料庫設定 =========
-DB_PATH = Path(__file__).with_name("portfolio_full.db")
+# 用新的 DB 檔，避免舊的 portfolio_full.db schema 衝突
+DB_PATH = Path(__file__).with_name("portfolio_multi.db")
 
 
 def get_db():
@@ -37,56 +49,92 @@ def get_db():
 
 def init_db():
     conn = get_db()
-    # 交易紀錄
+
+    # 使用者帳號
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL
+        )
+        """
+    )
+
+    # 交易紀錄（加 user_id）
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
             ts TEXT NOT NULL,
             symbol TEXT NOT NULL,
             shares INTEGER NOT NULL,
             amount REAL NOT NULL,
-            reinvest REAL NOT NULL
+            reinvest REAL NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
         )
         """
     )
-    # 持股
+
+    # 持股（加 user_id）
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS holdings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
             symbol TEXT NOT NULL,
             name TEXT NOT NULL,
             shares INTEGER NOT NULL,
-            cost REAL NOT NULL
+            cost REAL NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
         )
         """
     )
-    # 配息
+
+    # 配息（加 user_id）
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS dividends (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
             date TEXT NOT NULL,
             symbol TEXT NOT NULL,
             cash REAL NOT NULL,
-            note TEXT
+            note TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id)
         )
         """
     )
-    # 定期定額
+
+    # 定期定額（加 user_id）
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS dca (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
             date TEXT NOT NULL,
             symbol TEXT NOT NULL,
-            amount REAL NOT NULL
+            amount REAL NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
         )
         """
     )
+
     conn.commit()
     conn.close()
+
+
+# ======== 工具：登入保護 =========
+
+def login_required(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        if "user_id" not in session:
+            flash("請先登入")
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return wrapped
 
 
 # ======== 工具：格式化 =========
@@ -119,33 +167,42 @@ def fetch_price_tw(symbol):
     return DEFAULT_PRICES.get(symbol, 0.0)
 
 
-# ======== DB 讀取工具 =========
+# ======== DB 讀取工具（全部加 user_id） =========
 
-def get_all_holdings():
+def get_all_holdings(user_id):
     conn = get_db()
-    cur = conn.execute("SELECT * FROM holdings ORDER BY symbol")
+    cur = conn.execute(
+        "SELECT * FROM holdings WHERE user_id = ? ORDER BY symbol",
+        (user_id,),
+    )
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def get_all_dividends():
+def get_all_dividends(user_id):
     conn = get_db()
-    cur = conn.execute("SELECT * FROM dividends ORDER BY date DESC, id DESC")
+    cur = conn.execute(
+        "SELECT * FROM dividends WHERE user_id = ? ORDER BY date DESC, id DESC",
+        (user_id,),
+    )
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def get_all_dca():
+def get_all_dca(user_id):
     conn = get_db()
-    cur = conn.execute("SELECT * FROM dca ORDER BY date DESC, id DESC")
+    cur = conn.execute(
+        "SELECT * FROM dca WHERE user_id = ? ORDER BY date DESC, id DESC",
+        (user_id,),
+    )
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def get_trades_summary():
+def get_trades_summary(user_id):
     """
     回傳：
       summary: {symbol: {add_shares, add_amount, add_reinvest}}
@@ -160,8 +217,10 @@ def get_trades_summary():
           COALESCE(SUM(amount),0)  AS add_amount,
           COALESCE(SUM(reinvest),0) AS add_reinvest
         FROM trades
+        WHERE user_id = ?
         GROUP BY symbol
-        """
+        """,
+        (user_id,),
     )
     rows = cur.fetchall()
     conn.close()
@@ -188,52 +247,68 @@ def get_trades_summary():
     return summary, total_amount, total_reinvest, total_new_cash
 
 
-# ======== 配息 / DCA 計算工具 =========
+# ======== 配息 / DCA 計算工具（加 user_id） =========
 
-def get_dividends_total(symbol):
+def get_dividends_total(symbol, user_id):
     conn = get_db()
     cur = conn.execute(
-        "SELECT COALESCE(SUM(cash),0) AS s FROM dividends WHERE symbol = ?",
-        (symbol,),
+        "SELECT COALESCE(SUM(cash),0) AS s FROM dividends WHERE symbol = ? AND user_id = ?",
+        (symbol, user_id),
     )
     row = cur.fetchone()
     conn.close()
     return row["s"] if row and row["s"] is not None else 0.0
 
 
-def get_dividends_total_by_year(year):
+def get_dividends_total_by_year(year, user_id):
     conn = get_db()
     cur = conn.execute(
-        "SELECT COALESCE(SUM(cash),0) AS s FROM dividends WHERE substr(date,1,4) = ?",
-        (str(year),),
+        """
+        SELECT COALESCE(SUM(cash),0) AS s
+        FROM dividends
+        WHERE substr(date,1,4) = ? AND user_id = ?
+        """,
+        (str(year), user_id),
     )
     row = cur.fetchone()
     conn.close()
     return row["s"] if row and row["s"] is not None else 0.0
 
 
-def get_last_dividend_event(symbol):
+def get_last_dividend_event(symbol, user_id):
     conn = get_db()
     cur = conn.execute(
-        "SELECT * FROM dividends WHERE symbol = ? ORDER BY date DESC, id DESC LIMIT 1",
-        (symbol,),
+        """
+        SELECT *
+        FROM dividends
+        WHERE symbol = ? AND user_id = ?
+        ORDER BY date DESC, id DESC
+        LIMIT 1
+        """,
+        (symbol, user_id),
     )
     row = cur.fetchone()
     conn.close()
     return row
 
 
-def get_dca_total(year=None):
+def get_dca_total(user_id, year=None):
     conn = get_db()
     if year is None:
-        cur = conn.execute("SELECT COALESCE(SUM(amount),0) AS s FROM dca")
-        row = cur.fetchone()
+        cur = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) AS s FROM dca WHERE user_id = ?",
+            (user_id,),
+        )
     else:
         cur = conn.execute(
-            "SELECT COALESCE(SUM(amount),0) AS s FROM dca WHERE substr(date,1,4) = ?",
-            (str(year),),
+            """
+            SELECT COALESCE(SUM(amount),0) AS s
+            FROM dca
+            WHERE user_id = ? AND substr(date,1,4) = ?
+            """,
+            (user_id, str(year)),
         )
-        row = cur.fetchone()
+    row = cur.fetchone()
     conn.close()
     return row["s"] if row and row["s"] is not None else 0.0
 
@@ -260,7 +335,7 @@ def get_pre_ex_close_price(symbol, ex_date_str):
     return pre_close
 
 
-def compute_fill_infos(etf_rows):
+def compute_fill_infos(etf_rows, user_id):
     """
     傳入 compute_dashboard() 產出的 etfs list，
     回傳每檔 ETF 的填息資訊（最近一次配息）。
@@ -273,7 +348,7 @@ def compute_fill_infos(etf_rows):
         now_price = e["price"]
         name = e["name"]
 
-        last_ev = get_last_dividend_event(symbol)
+        last_ev = get_last_dividend_event(symbol, user_id)
         if not last_ev:
             continue
 
@@ -333,10 +408,10 @@ def estimate_years_to_target(current_value, monthly_invest, annual_return, targe
     return None
 
 
-# ======== 儀表板計算 =========
+# ======== 儀表板計算（加 user_id） =========
 
-def compute_dashboard():
-    holdings_rows = list(get_all_holdings())
+def compute_dashboard(user_id):
+    holdings_rows = list(get_all_holdings(user_id))
     etf_rows = []
 
     total_cost = 0.0
@@ -362,7 +437,7 @@ def compute_dashboard():
         profit = mv - cost_total
         pl_pct = (profit / cost_total * 100) if cost_total else 0.0
 
-        div_total = get_dividends_total(symbol)
+        div_total = get_dividends_total(symbol, user_id)
         profit_with_div = profit + div_total
         pl_with_div_pct = (profit_with_div / cost_total * 100) if cost_total else 0.0
 
@@ -391,11 +466,11 @@ def compute_dashboard():
 
     current_year = datetime.now().year
     last_year = current_year - 1
-    div_last_year = get_dividends_total_by_year(last_year)
-    div_this_year = get_dividends_total_by_year(current_year)
+    div_last_year = get_dividends_total_by_year(last_year, user_id)
+    div_this_year = get_dividends_total_by_year(current_year, user_id)
     diff_div = div_this_year - div_last_year
 
-    dca_total_all = get_dca_total()
+    dca_total_all = get_dca_total(user_id)
     profit_vs_dca = None
     pl_vs_dca_pct = None
     if dca_total_all > 0 and total_mv > 0:
@@ -405,10 +480,14 @@ def compute_dashboard():
     current_mv = total_mv
     diff_low = max(0.0, HOUSE_TARGET_LOW - current_mv)
     diff_high = max(0.0, HOUSE_TARGET_HIGH - current_mv)
-    years_low = estimate_years_to_target(current_mv, MONTHLY_DCA, ANNUAL_RETURN, HOUSE_TARGET_LOW) if current_mv > 0 else None
-    years_high = estimate_years_to_target(current_mv, MONTHLY_DCA, ANNUAL_RETURN, HOUSE_TARGET_HIGH) if current_mv > 0 else None
+    years_low = estimate_years_to_target(
+        current_mv, MONTHLY_DCA, ANNUAL_RETURN, HOUSE_TARGET_LOW
+    ) if current_mv > 0 else None
+    years_high = estimate_years_to_target(
+        current_mv, MONTHLY_DCA, ANNUAL_RETURN, HOUSE_TARGET_HIGH
+    ) if current_mv > 0 else None
 
-    fill_infos = compute_fill_infos(etf_rows) if etf_rows else []
+    fill_infos = compute_fill_infos(etf_rows, user_id) if etf_rows else []
 
     return {
         "etfs": etf_rows,
@@ -444,7 +523,7 @@ def compute_dashboard():
     }
 
 
-# ======== HTML 模板：首頁（儀表板） =========
+# ======== HTML 模板：首頁（儀表板，含登入資訊） =========
 
 TEMPLATE_INDEX = """
 <!doctype html>
@@ -485,6 +564,17 @@ TEMPLATE_INDEX = """
       color: #3949ab;
       text-decoration: none;
       margin: 0 4px;
+    }
+    .userbar {
+      text-align:center;
+      font-size:12px;
+      margin-bottom:6px;
+      color:#555;
+    }
+    .userbar a {
+      color:#3949ab;
+      text-decoration:none;
+      margin-left:6px;
     }
     .card {
       background: #fff;
@@ -576,10 +666,31 @@ TEMPLATE_INDEX = """
     button {
       cursor: pointer;
     }
+    .flash {
+      background:#ffeaa7;
+      padding:6px 10px;
+      border-radius:999px;
+      font-size:12px;
+      margin-bottom:8px;
+      text-align:center;
+    }
   </style>
 </head>
 <body>
 <div class="container">
+  {% with messages = get_flashed_messages() %}
+    {% if messages %}
+      {% for m in messages %}
+        <div class="flash">{{ m }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  <div class="userbar">
+    已登入：{{ session['username'] }} |
+    <a href="{{ url_for('logout') }}">登出</a>
+  </div>
+
   <h1>ETF & 買房儀表板</h1>
   <div class="subtitle">最後更新：{{ now }}</div>
   <div class="nav">
@@ -786,7 +897,7 @@ TEMPLATE_HOLDINGS = """
     .card{background:#fff;border-radius:16px;padding:14px 16px;margin-bottom:10px;box-shadow:0 4px 12px rgba(0,0,0,0.06);font-size:13px;}
     .row{display:flex;justify-content:space-between;margin:4px 0;gap:6px;align-items:center;}
     .label{color:#555;}
-    input[type="text"],input[type="number"]{flex:1;border-radius:999px;border:1px solid #ddd;padding:4px 8px;font-size:13px;}
+    input[type="text"],input[type="number"]{flex:1;border-radius:999px;border:1px solid:#ddd;padding:4px 8px;font-size:13px;}
     .btn-row{text-align:right;margin-top:8px;}
     .btn{display:inline-block;padding:4px 10px;border-radius:999px;border:none;font-size:12px;cursor:pointer;text-decoration:none;margin-left:6px;}
     .btn-primary{background:#3949ab;color:#fff;}
@@ -1014,7 +1125,7 @@ TEMPLATE_DIVIDENDS = """
       <a href="{{ url_for('edit_dividend', div_id=d.id) }}" class="btn btn-secondary">編輯</a>
       <form class="inline" method="post"
             action="{{ url_for('delete_dividend', div_id=d.id) }}"
-            onsubmit="return confirm('確定要刪除這筆配息紀錄嗎？\\nID: {{ d.id }}  標的: {{ d.symbol }}');">
+            onsubmit="return confirm('確定要刪除這筆配息紀錄嗎?\\nID: {{ d.id }}  標的: {{ d.symbol }}');">
         <button type="submit" class="btn btn-danger">刪除</button>
       </form>
     </div>
@@ -1106,7 +1217,7 @@ TEMPLATE_DCA = """
     .card{background:#fff;border-radius:16px;padding:14px 16px;margin-bottom:10px;box-shadow:0 4px 12px rgba(0,0,0,0.06);font-size:13px;}
     .row{display:flex;justify-content:space-between;margin:4px 0;gap:6px;align-items:center;}
     .label{color:#555;}
-    input[type="text"],input[type="number"],input[type="date"]{flex:1;border-radius:999px;border:1px solid #ddd;padding:4px 8px;font-size:13px;}
+    input[type="text"],input[type="number"],input[type="date"]{flex:1;border-radius:999px;border:1px solid:#ddd;padding:4px 8px;font-size:13px;}
     .btn-row{text-align:right;margin-top:8px;}
     .btn{display:inline-block;padding:4px 10px;border-radius:999px;border:none;font-size:12px;cursor:pointer;text-decoration:none;margin-left:6px;}
     .btn-primary{background:#3949ab;color:#fff;}
@@ -1248,7 +1359,7 @@ TEMPLATE_TRADES = """
     .container{max-width:540px;margin:0 auto 32px;}
     h1{font-size:22px;text-align:center;margin-bottom:8px;}
     .subtitle{text-align:center;font-size:12px;color:#666;margin-bottom:8px;}
-    .top-link{textalign:center;margin-bottom:10px;font-size:12px;}
+    .top-link{text-align:center;margin-bottom:10px;font-size:12px;}
     .top-link a{color:#3949ab;text-decoration:none;}
     .card{background:#fff;border-radius:16px;padding:14px 16px;margin-bottom:10px;box-shadow:0 4px 12px rgba(0,0,0,0.06);font-size:13px;}
     .row{display:flex;justify-content:space-between;margin:2px 0;gap:6px;align-items:center;}
@@ -1414,7 +1525,7 @@ TEMPLATE_TRADES_EDIT = """
     .card{background:#fff;border-radius:16px;padding:16px 18px;margin-bottom:14px;box-shadow:0 4px 12px rgba(0,0,0,0.06);}
     .row{display:flex;justify-content:space-between;margin:6px 0;gap:8px;align-items:center;font-size:14px;}
     .label{color:#555;flex:0 0 90px;}
-    input[type="text"],input[type="number"]{flex:1;border-radius:999px;border:1px solid #ddd;padding:6px 10px;font-size:14px;}
+    input[type="text"],input[type="number"]{flex:1;border-radius:999px;border:1px solid:#ddd;padding:6px 10px;font-size:14px;}
     .note{font-size:11px;color:#777;margin-top:6px;line-height:1.4;}
     .btn-row{text-align:right;margin-top:10px;}
     .btn{display:inline-block;padding:6px 14px;border-radius:999px;border:none;font-size:13px;cursor:pointer;text-decoration:none;margin-left:8px;}
@@ -1465,11 +1576,188 @@ TEMPLATE_TRADES_EDIT = """
 # ======== Flask App & Routes =========
 
 app = Flask(__name__)
+app.secret_key = "CHANGE_THIS_TO_RANDOM_STRING"  # 記得改成自己的隨機字串
 init_db()
 
+# ======== 登入 / 註冊 / 登出 =========
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        if not username or not password:
+            flash("帳號與密碼必填")
+            return redirect(url_for("login"))
+
+        conn = get_db()
+        cur = conn.execute("SELECT * FROM users WHERE username = ?", (username,))
+        user = cur.fetchone()
+        conn.close()
+
+        if user and check_password_hash(user["password_hash"], password):
+            session["user_id"] = user["id"]
+            session["username"] = user["username"]
+            flash("登入成功")
+            return redirect(url_for("index"))
+        else:
+            flash("帳號或密碼錯誤")
+            return redirect(url_for("login"))
+
+    login_html = """
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>登入</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;margin:0;padding:16px;}
+        .container{max-width:420px;margin:40px auto;}
+        h1{text-align:center;font-size:24px;margin-bottom:10px;}
+        .card{background:#fff;border-radius:16px;padding:16px 18px;box-shadow:0 6px 18px rgba(0,0,0,0.06);}
+        .row{display:flex;gap:8px;margin:6px 0;align-items:center;}
+        .label{flex:0 0 60px;color:#555;font-size:14px;}
+        input[type="text"],input[type="password"]{flex:1;border-radius:999px;border:1px solid:#ddd;padding:6px 10px;font-size:14px;}
+        .btn-row{text-align:right;margin-top:10px;}
+        button{padding:6px 14px;border-radius:999px;border:none;background:#3949ab;color:#fff;font-size:14px;cursor:pointer;}
+        .link{text-align:center;margin-top:10px;font-size:13px;}
+        .link a{color:#3949ab;text-decoration:none;}
+        .flash{background:#ffeaa7;padding:6px 10px;border-radius:999px;font-size:12px;margin-bottom:8px;text-align:center;}
+      </style>
+    </head>
+    <body>
+    <div class="container">
+      {% with messages = get_flashed_messages() %}
+        {% if messages %}
+          {% for m in messages %}
+            <div class="flash">{{ m }}</div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+      <h1>ETF 儀表板登入</h1>
+      <div class="card">
+        <form method="post">
+          <div class="row">
+            <span class="label">帳號</span>
+            <input type="text" name="username" required>
+          </div>
+          <div class="row">
+            <span class="label">密碼</span>
+            <input type="password" name="password" required>
+          </div>
+          <div class="btn-row">
+            <button type="submit">登入</button>
+          </div>
+        </form>
+        <div class="link">
+          還沒有帳號？ <a href="{{ url_for('register') }}">去註冊</a>
+        </div>
+      </div>
+    </div>
+    </body>
+    </html>
+    """
+    return render_template_string(login_html)
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        if not username or not password:
+            flash("帳號與密碼必填")
+            return redirect(url_for("register"))
+
+        conn = get_db()
+        try:
+            conn.execute(
+                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                (username, generate_password_hash(password)),
+            )
+            conn.commit()
+            flash("註冊成功，請登入")
+            return redirect(url_for("login"))
+        except sqlite3.IntegrityError:
+            flash("此帳號已被使用")
+            return redirect(url_for("register"))
+        finally:
+            conn.close()
+
+    register_html = """
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>註冊</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;margin:0;padding:16px;}
+        .container{max-width:420px;margin:40px auto;}
+        h1{text-align:center;font-size:24px;margin-bottom:10px;}
+        .card{background:#fff;border-radius:16px;padding:16px 18px;box-shadow:0 6px 18px rgba(0,0,0,0.06);}
+        .row{display:flex;gap:8px;margin:6px 0;align-items:center;}
+        .label{flex:0 0 60px;color:#555;font-size:14px;}
+        input[type="text"],input[type="password"]{flex:1;border-radius:999px;border:1px solid:#ddd;padding:6px 10px;font-size:14px;}
+        .btn-row{text-align:right;margin-top:10px;}
+        button{padding:6px 14px;border-radius:999px;border:none;background:#3949ab;color:#fff;font-size:14px;cursor:pointer;}
+        .link{text-align:center;margin-top:10px;font-size:13px;}
+        .link a{color:#3949ab;text-decoration:none;}
+        .flash{background:#ffeaa7;padding:6px 10px;border-radius:999px;font-size:12px;margin-bottom:8px;text-align:center;}
+      </style>
+    </head>
+    <body>
+    <div class="container">
+      {% with messages = get_flashed_messages() %}
+        {% if messages %}
+          {% for m in messages %}
+            <div class="flash">{{ m }}</div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+      <h1>註冊帳號</h1>
+      <div class="card">
+        <form method="post">
+          <div class="row">
+            <span class="label">帳號</span>
+            <input type="text" name="username" required>
+          </div>
+          <div class="row">
+            <span class="label">密碼</span>
+            <input type="password" name="password" required>
+          </div>
+          <div class="btn-row">
+            <button type="submit">建立帳號</button>
+          </div>
+        </form>
+        <div class="link">
+          已有帳號？ <a href="{{ url_for('login') }}">去登入</a>
+        </div>
+      </div>
+    </div>
+    </body>
+    </html>
+    """
+    return render_template_string(register_html)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("已登出")
+    return redirect(url_for("login"))
+
+
+# ======== 首頁（儀表板） =========
 
 @app.route("/", methods=["GET", "POST"])
+@login_required
 def index():
+    user_id = session["user_id"]
+
     # 新增交易
     if request.method == "POST":
         date_str = request.form.get("date", "").strip()
@@ -1501,14 +1789,17 @@ def index():
 
             conn = get_db()
             conn.execute(
-                "INSERT INTO trades (ts, symbol, shares, amount, reinvest) VALUES (?,?,?,?,?)",
-                (ts_value, symbol, shares, amount, reinvest),
+                """
+                INSERT INTO trades (user_id, ts, symbol, shares, amount, reinvest)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, ts_value, symbol, shares, amount, reinvest),
             )
             conn.commit()
             conn.close()
 
-    trades_summary, total_amount, total_reinvest, total_new_cash = get_trades_summary()
-    data = compute_dashboard()
+    _, total_amount, total_reinvest, total_new_cash = get_trades_summary(user_id)
+    data = compute_dashboard(user_id)
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     today_date = datetime.now().strftime("%Y-%m-%d")
 
@@ -1527,14 +1818,17 @@ def index():
         ANNUAL_RETURN=ANNUAL_RETURN,
         MONTHLY_DCA=MONTHLY_DCA,
         trade_totals=trade_totals,
-        **data,   # 這裡包含 etfs / totals / div_compare / dca_compare / house_goal / fill_infos
+        **data,   # etfs / totals / div_compare / dca_compare / house_goal / fill_infos
     )
 
 
-# ----- 持股管理 -----
+# ======== 持股管理 =========
 
 @app.route("/holdings", methods=["GET", "POST"])
+@login_required
 def holdings_page():
+    user_id = session["user_id"]
+
     if request.method == "POST":
         symbol = request.form.get("symbol", "").strip()
         name = request.form.get("name", "").strip()
@@ -1554,13 +1848,16 @@ def holdings_page():
         if symbol and name and shares > 0 and cost > 0:
             conn = get_db()
             conn.execute(
-                "INSERT INTO holdings (symbol, name, shares, cost) VALUES (?,?,?,?)",
-                (symbol, name, shares, cost),
+                """
+                INSERT INTO holdings (user_id, symbol, name, shares, cost)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, symbol, name, shares, cost),
             )
             conn.commit()
             conn.close()
 
-    holdings = get_all_holdings()
+    holdings = get_all_holdings(user_id)
     return render_template_string(
         TEMPLATE_HOLDINGS,
         holdings=holdings,
@@ -1568,9 +1865,14 @@ def holdings_page():
 
 
 @app.route("/holdings/edit/<int:holding_id>", methods=["GET", "POST"])
+@login_required
 def edit_holding(holding_id):
+    user_id = session["user_id"]
     conn = get_db()
-    cur = conn.execute("SELECT * FROM holdings WHERE id = ?", (holding_id,))
+    cur = conn.execute(
+        "SELECT * FROM holdings WHERE id = ? AND user_id = ?",
+        (holding_id, user_id),
+    )
     row = cur.fetchone()
 
     if not row:
@@ -1595,8 +1897,12 @@ def edit_holding(holding_id):
 
         if symbol and name and shares > 0 and cost > 0:
             conn.execute(
-                "UPDATE holdings SET symbol = ?, name = ?, shares = ?, cost = ? WHERE id = ?",
-                (symbol, name, shares, cost, holding_id),
+                """
+                UPDATE holdings
+                SET symbol = ?, name = ?, shares = ?, cost = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (symbol, name, shares, cost, holding_id, user_id),
             )
             conn.commit()
             conn.close()
@@ -1610,18 +1916,26 @@ def edit_holding(holding_id):
 
 
 @app.route("/holdings/delete/<int:holding_id>", methods=["POST"])
+@login_required
 def delete_holding(holding_id):
+    user_id = session["user_id"]
     conn = get_db()
-    conn.execute("DELETE FROM holdings WHERE id = ?", (holding_id,))
+    conn.execute(
+        "DELETE FROM holdings WHERE id = ? AND user_id = ?",
+        (holding_id, user_id),
+    )
     conn.commit()
     conn.close()
     return redirect(url_for("holdings_page"))
 
 
-# ----- 配息管理 -----
+# ======== 配息管理 =========
 
 @app.route("/dividends", methods=["GET", "POST"])
+@login_required
 def dividends_page():
+    user_id = session["user_id"]
+
     if request.method == "POST":
         date_str = request.form.get("date", "").strip()
         symbol = request.form.get("symbol", "").strip()
@@ -1636,13 +1950,16 @@ def dividends_page():
         if date_str and symbol and cash > 0:
             conn = get_db()
             conn.execute(
-                "INSERT INTO dividends (date, symbol, cash, note) VALUES (?,?,?,?)",
-                (date_str, symbol, cash, note if note else None),
+                """
+                INSERT INTO dividends (user_id, date, symbol, cash, note)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, date_str, symbol, cash, note if note else None),
             )
             conn.commit()
             conn.close()
 
-    dividends = get_all_dividends()
+    dividends = get_all_dividends(user_id)
     return render_template_string(
         TEMPLATE_DIVIDENDS,
         dividends=dividends,
@@ -1651,9 +1968,14 @@ def dividends_page():
 
 
 @app.route("/dividends/edit/<int:div_id>", methods=["GET", "POST"])
+@login_required
 def edit_dividend(div_id):
+    user_id = session["user_id"]
     conn = get_db()
-    cur = conn.execute("SELECT * FROM dividends WHERE id = ?", (div_id,))
+    cur = conn.execute(
+        "SELECT * FROM dividends WHERE id = ? AND user_id = ?",
+        (div_id, user_id),
+    )
     row = cur.fetchone()
 
     if not row:
@@ -1673,8 +1995,12 @@ def edit_dividend(div_id):
 
         if date_str and symbol and cash > 0:
             conn.execute(
-                "UPDATE dividends SET date = ?, symbol = ?, cash = ?, note = ? WHERE id = ?",
-                (date_str, symbol, cash, note if note else None, div_id),
+                """
+                UPDATE dividends
+                SET date = ?, symbol = ?, cash = ?, note = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (date_str, symbol, cash, note if note else None, div_id, user_id),
             )
             conn.commit()
             conn.close()
@@ -1688,18 +2014,26 @@ def edit_dividend(div_id):
 
 
 @app.route("/dividends/delete/<int:div_id>", methods=["POST"])
+@login_required
 def delete_dividend(div_id):
+    user_id = session["user_id"]
     conn = get_db()
-    conn.execute("DELETE FROM dividends WHERE id = ?", (div_id,))
+    conn.execute(
+        "DELETE FROM dividends WHERE id = ? AND user_id = ?",
+        (div_id, user_id),
+    )
     conn.commit()
     conn.close()
     return redirect(url_for("dividends_page"))
 
 
-# ----- DCA 管理 -----
+# ======== DCA 管理 =========
 
 @app.route("/dca", methods=["GET", "POST"])
+@login_required
 def dca_page():
+    user_id = session["user_id"]
+
     if request.method == "POST":
         date_str = request.form.get("date", "").strip()
         symbol = request.form.get("symbol", "").strip()
@@ -1713,13 +2047,16 @@ def dca_page():
         if date_str and symbol and amount > 0:
             conn = get_db()
             conn.execute(
-                "INSERT INTO dca (date, symbol, amount) VALUES (?,?,?)",
-                (date_str, symbol, amount),
+                """
+                INSERT INTO dca (user_id, date, symbol, amount)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, date_str, symbol, amount),
             )
             conn.commit()
             conn.close()
 
-    records = get_all_dca()
+    records = get_all_dca(user_id)
     return render_template_string(
         TEMPLATE_DCA,
         records=records,
@@ -1728,9 +2065,14 @@ def dca_page():
 
 
 @app.route("/dca/edit/<int:dca_id>", methods=["GET", "POST"])
+@login_required
 def edit_dca(dca_id):
+    user_id = session["user_id"]
     conn = get_db()
-    cur = conn.execute("SELECT * FROM dca WHERE id = ?", (dca_id,))
+    cur = conn.execute(
+        "SELECT * FROM dca WHERE id = ? AND user_id = ?",
+        (dca_id, user_id),
+    )
     row = cur.fetchone()
 
     if not row:
@@ -1749,8 +2091,12 @@ def edit_dca(dca_id):
 
         if date_str and symbol and amount > 0:
             conn.execute(
-                "UPDATE dca SET date = ?, symbol = ?, amount = ? WHERE id = ?",
-                (date_str, symbol, amount, dca_id),
+                """
+                UPDATE dca
+                SET date = ?, symbol = ?, amount = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (date_str, symbol, amount, dca_id, user_id),
             )
             conn.commit()
             conn.close()
@@ -1764,33 +2110,46 @@ def edit_dca(dca_id):
 
 
 @app.route("/dca/delete/<int:dca_id>", methods=["POST"])
+@login_required
 def delete_dca(dca_id):
+    user_id = session["user_id"]
     conn = get_db()
-    conn.execute("DELETE FROM dca WHERE id = ?", (dca_id,))
+    conn.execute(
+        "DELETE FROM dca WHERE id = ? AND user_id = ?",
+        (dca_id, user_id),
+    )
     conn.commit()
     conn.close()
     return redirect(url_for("dca_page"))
 
 
-# ----- 交易管理 -----
+# ======== 交易管理 =========
 
 @app.route("/trades")
+@login_required
 def trades_page():
+    user_id = session["user_id"]
     conn = get_db()
 
-    cur = conn.execute("SELECT DISTINCT symbol FROM trades ORDER BY symbol")
+    cur = conn.execute(
+        "SELECT DISTINCT symbol FROM trades WHERE user_id = ? ORDER BY symbol",
+        (user_id,),
+    )
     symbols_rows = cur.fetchall()
     symbols = [r["symbol"] for r in symbols_rows]
 
-    cur = conn.execute("SELECT DISTINCT substr(ts,1,4) AS y FROM trades ORDER BY y DESC")
+    cur = conn.execute(
+        "SELECT DISTINCT substr(ts,1,4) AS y FROM trades WHERE user_id = ? ORDER BY y DESC",
+        (user_id,),
+    )
     years_rows = cur.fetchall()
     years = [r["y"] for r in years_rows if r["y"]]
 
     selected_symbol = request.args.get("symbol", "").strip()
     selected_year = request.args.get("year", "").strip()
 
-    sql = "SELECT * FROM trades WHERE 1=1"
-    params = []
+    sql = "SELECT * FROM trades WHERE user_id = ?"
+    params = [user_id]
 
     if selected_symbol:
         sql += " AND symbol = ?"
@@ -1805,7 +2164,7 @@ def trades_page():
     rows = cur.fetchall()
 
     # 全部累積
-    _, total_amount, total_reinvest, total_new_cash = get_trades_summary()
+    _, total_amount, total_reinvest, total_new_cash = get_trades_summary(user_id)
     trade_totals = {
         "total_amount": total_amount,
         "total_reinvest": total_reinvest,
@@ -1838,9 +2197,14 @@ def trades_page():
 
 
 @app.route("/trades/edit/<int:trade_id>", methods=["GET", "POST"])
+@login_required
 def edit_trade(trade_id):
+    user_id = session["user_id"]
     conn = get_db()
-    cur = conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,))
+    cur = conn.execute(
+        "SELECT * FROM trades WHERE id = ? AND user_id = ?",
+        (trade_id, user_id),
+    )
     row = cur.fetchone()
 
     if not row:
@@ -1872,8 +2236,12 @@ def edit_trade(trade_id):
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         conn.execute(
-            "UPDATE trades SET ts = ?, shares = ?, amount = ?, reinvest = ? WHERE id = ?",
-            (ts, shares, amount, reinvest, trade_id),
+            """
+            UPDATE trades
+            SET ts = ?, shares = ?, amount = ?, reinvest = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (ts, shares, amount, reinvest, trade_id, user_id),
         )
         conn.commit()
         conn.close()
@@ -1887,9 +2255,14 @@ def edit_trade(trade_id):
 
 
 @app.route("/trades/delete/<int:trade_id>", methods=["POST"])
+@login_required
 def delete_trade(trade_id):
+    user_id = session["user_id"]
     conn = get_db()
-    conn.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
+    conn.execute(
+        "DELETE FROM trades WHERE id = ? AND user_id = ?",
+        (trade_id, user_id),
+    )
     conn.commit()
     conn.close()
     return redirect(url_for("trades_page"))
